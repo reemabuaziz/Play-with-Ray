@@ -4,7 +4,7 @@
 
 ## التشغيل
 
-1. فك ضغط الملف وافتح مجلد `Play-With-Ray` في VS Code.
+1. افتح مجلد `Play-With-Ray` في VS Code.
 2. افتح Terminal داخل المجلد وشغّل:
 
    ```bash
