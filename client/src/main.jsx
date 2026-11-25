@@ -5,7 +5,14 @@ import { QRCodeCanvas } from "qrcode.react";
 import "./style.css";
 
 const API = (import.meta.env.VITE_SERVER_URL || (import.meta.env.PROD ? location.origin : `${location.protocol}//${location.hostname}:3000`)).replace(/\/$/, "");
-const socket = io(API, { autoConnect: true });
+const roomParams = new URLSearchParams(location.search);
+let roomId = roomParams.get("roomId");
+if (!roomId) {
+  roomId = crypto.randomUUID();
+  roomParams.set("roomId", roomId);
+  history.replaceState(null, "", `${location.pathname}?${roomParams.toString()}`);
+}
+const socket = io(API, { autoConnect: true, query: { roomId } });
 const money = n => `${n ?? 0} نقطة`;
 
 function App() {
@@ -38,9 +45,9 @@ function App() {
   }, [state?.timerStartedAt, state?.phase]);
 
   const mobileUrl = useMemo(() => {
-    if (import.meta.env.PROD) return `${location.origin}/?mobile=1`;
+    if (import.meta.env.PROD) return `${location.origin}/?roomId=${encodeURIComponent(roomId)}&mobile=1`;
     const ip = info.ips?.[0] || "localhost";
-    return `http://${ip}:5173/?mobile=1`;
+    return `http://${ip}:5173/?roomId=${encodeURIComponent(roomId)}&mobile=1`;
   }, [info.ips]);
 
   function emit(event, payload = {}) {
@@ -184,7 +191,8 @@ function App() {
       </section>}
     </>}
 
-<footer><a href="mailto:Reemabuaziz25@gmail.com">Reemabuaziz25@gmail.com</a><span>•</span>Created by Eng. Ray</footer>    {toast && <div className="toast">{toast}</div>}
+    <footer>Created by Eng. Ray</footer>
+    {toast && <div className="toast">{toast}</div>}
     {showRules && <div className="modal-backdrop" onClick={()=>setShowRules(false)}><section className="modal" onClick={e=>e.stopPropagation()}><button className="close" onClick={()=>setShowRules(false)}>×</button><h2>قوانين اللعبة ⭕</h2><ul>
       <li>الفوز يبدأ من 1000 نقطة.</li><li>للاعب 25 ثانية للشرح.</li><li>كلمة أو جملة واحدة فقط، مع لون واحد ومكان واحد كحد أقصى.</li><li>أول من يخمن يحصل على 100 نقطة، والشارح يحصل على 50 نقطة.</li><li>إذا لم يخمن أحد، يخسر الشارح 100 نقطة.</li><li>يمنع ذكر الاسم أو الجنسية أو صلة القرابة أو الجنس.</li><li>يمنع اختيار شخص يعرفه لاعب واحد فقط أو لا يعرفه جميع الموجودين.</li><li>الغش يخصم 100 نقطة حسب قرار مدير اللعبة.</li></ul><button className="btn blue" onClick={()=>setShowRules(false)}>إغلاق</button></section></div>}
   </main>;
