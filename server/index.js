@@ -17,7 +17,6 @@ const httpServer = createServer(app);
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
 const dataDir = process.env.DATA_DIR || path.join(__dirname, "data");
-const saveFile = path.join(dataDir, "game.json");
 fs.mkdirSync(dataDir, { recursive: true });
 const pool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
@@ -28,10 +27,19 @@ const initial = () => ({
   currentName: null, scores: {}, roundTarget: 1000, roundWinners: [], gameNumber: 1,
   timerStartedAt: null, timerDuration: 25, skipsUsed: {}, lastEvent: null
 });
+const states = new Map();
+let activeRoomId = null;
 let state = initial();
-try {
-  if (!pool && fs.existsSync(saveFile)) state = JSON.parse(fs.readFileSync(saveFile, "utf8"));
-} catch { state = initial(); }
+function roomFile(roomId) { return path.join(dataDir, `${roomId}.json`); }
+function loadRoom(roomId) {
+  if (states.has(roomId)) return states.get(roomId);
+  let roomState = initial();
+  try {
+    if (!pool && fs.existsSync(roomFile(roomId))) roomState = JSON.parse(fs.readFileSync(roomFile(roomId), "utf8"));
+  } catch { roomState = initial(); }
+  states.set(roomId, roomState);
+  return roomState;
+}
 function recoverFinishedGame() {
   if (state.phase !== "finished") return false;
   const players = Array.isArray(state.players) ? state.players : [];
@@ -41,24 +49,28 @@ function recoverFinishedGame() {
   return true;
 }
 
-let persistQueue = Promise.resolve();
+const persistQueues = new Map();
 function persist() {
+  const roomId = activeRoomId;
   const savedState = JSON.stringify(state);
-  persistQueue = persistQueue.catch(() => {}).then(async () => {
+  const previous = persistQueues.get(roomId) || Promise.resolve();
+  const next = previous.catch(() => {}).then(async () => {
     if (pool) {
       await pool.query(
-        "INSERT INTO play_with_ray_state (id, state, updated_at) VALUES (1, $1::jsonb, NOW()) ON CONFLICT (id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()",
-        [savedState]
+        "INSERT INTO play_with_ray_rooms (room_id, state, updated_at) VALUES ($1, $2::jsonb, NOW()) ON CONFLICT (room_id) DO UPDATE SET state = EXCLUDED.state, updated_at = NOW()",
+        [roomId, savedState]
       );
     } else {
-      fs.writeFileSync(saveFile, JSON.stringify(JSON.parse(savedState), null, 2), "utf8");
+      fs.writeFileSync(roomFile(roomId), JSON.stringify(JSON.parse(savedState), null, 2), "utf8");
     }
   });
-  return persistQueue;
+  persistQueues.set(roomId, next);
+  return next;
 }
 function broadcast() {
+  states.set(activeRoomId, state);
   persist().catch(error => console.error("Could not save game state:", error.message));
-  io.emit("state", snapshot());
+  io.to(activeRoomId).emit("state", snapshot());
 }
 function snapshot() {
   return {
@@ -117,9 +129,9 @@ app.get("/api/info", (_req, res) => {
   for (const list of Object.values(nets)) for (const n of list || []) {
     if (n.family === "IPv4" && !n.internal) ips.push(n.address);
   }
-  res.json({ ips, port: PORT, state: snapshot() });
+  res.json({ ips, port: PORT });
 });
-app.get("/api/state", (_req, res) => res.json(snapshot()));
+app.get("/api/state", (_req, res) => res.json(initial()));
 
 const clientDist = path.resolve(__dirname, "../client/dist");
 if (fs.existsSync(path.join(clientDist, "index.html"))) {
@@ -130,10 +142,26 @@ if (fs.existsSync(path.join(clientDist, "index.html"))) {
   });
 }
 
-io.on("connection", socket => {
+io.on("connection", async socket => {
+  const requestedRoom = String(socket.handshake.query.roomId || "");
+  const roomId = /^[a-zA-Z0-9-]{8,80}$/.test(requestedRoom) ? requestedRoom : crypto.randomUUID();
+  if (pool && !states.has(roomId)) {
+    const { rows } = await pool.query("SELECT state FROM play_with_ray_rooms WHERE room_id = $1", [roomId]);
+    states.set(roomId, rows[0]?.state || initial());
+  }
+  activeRoomId = roomId;
+  state = loadRoom(roomId);
+  if (recoverFinishedGame()) {
+    states.set(roomId, state);
+    persist().catch(error => console.error("Could not save game state:", error.message));
+  }
+  socket.join(roomId);
+  socket.emit("room-ready", { roomId });
   socket.emit("state", snapshot());
 
   socket.on("register-player", ({ name }, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     if (state.phase !== "setup") return cb({ error: "التسجيل مغلق حالياً." });
     const clean = safeText(name);
     if (!clean) return cb({ error: "اكتب اسم اللاعب." });
@@ -147,6 +175,8 @@ io.on("connection", socket => {
   });
 
   socket.on("submit-names", ({ playerId, names }, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     if (state.phase !== "setup") return cb({ error: "انتهى وقت إدخال الأسماء." });
     const player = state.players.find(p => p.id === playerId);
     if (!player) return cb({ error: "اختر اسمك من قائمة اللاعبين أولاً." });
@@ -169,6 +199,8 @@ io.on("connection", socket => {
   });
 
   socket.on("start-game", (_payload, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     if (state.phase !== "setup") return cb({ error: "اللعبة بدأت بالفعل." });
     if (state.players.length < 2) return cb({ error: "أضف لاعبين اثنين على الأقل." });
     if (state.players.some(p => state.names.filter(n => n.owner === p.id).length < 5)) return cb({ error: "يجب أن يضيف كل لاعب 5 أسماء على الأقل." });
@@ -187,6 +219,8 @@ io.on("connection", socket => {
   });
 
   socket.on("reveal-current", ({ playerId }, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     const currentPlayer = state.players[state.currentPlayerIndex];
     if (state.phase !== "playing" || !state.currentName) return cb({ error: "لا يوجد اسم حالي للكشف." });
     if (!currentPlayer || currentPlayer.id !== playerId) return cb({ error: "هذا ليس دورك حالياً." });
@@ -199,6 +233,8 @@ io.on("connection", socket => {
   });
 
   socket.on("start-timer", (_payload, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     if (state.phase !== "playing" || state.timerStartedAt) return cb({ error: "لا يمكن بدء المؤقت الآن." });
     state.timerStartedAt = Date.now();
     state.lastEvent = "timer_started";
@@ -206,6 +242,8 @@ io.on("connection", socket => {
   });
 
   socket.on("skip-turn", ({ playerId }, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     const currentPlayer = state.players[state.currentPlayerIndex];
     if (state.phase !== "playing" || !currentPlayer) return cb({ error: "لا توجد جولة نشطة." });
     if (currentPlayer.id !== playerId) return cb({ error: "هذا ليس دورك حالياً." });
@@ -217,6 +255,8 @@ io.on("connection", socket => {
   });
 
   socket.on("cheat-player", ({ playerId }, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     if (state.phase !== "playing") return cb({ error: "لا توجد جولة نشطة." });
     const player = state.players.find(p => p.id === playerId);
     if (!player) return cb({ error: "اختر لاعباً صحيحاً." });
@@ -227,11 +267,15 @@ io.on("connection", socket => {
   });
 
   socket.on("award-player", ({ playerId }, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     if (state.phase !== "playing") return cb({ error: "لا توجد جولة نشطة." });
     const result = award(playerId); cb(result);
   });
 
   socket.on("no-one-guessed", (_payload, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     if (state.phase !== "playing") return cb({ error: "لا توجد جولة نشطة." });
     const explainer = state.players[state.currentPlayerIndex];
     if (explainer) state.scores[explainer.id] = (state.scores[explainer.id] || 0) - 100;
@@ -239,6 +283,8 @@ io.on("connection", socket => {
   });
 
   socket.on("continue-round", (_payload, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     if (state.phase !== "round_winner") return cb({ error: "لا توجد نهاية راوند." });
     if (!state.names.some(n => !state.usedNameIds.includes(n.id))) {
       state.phase = "finished"; state.lastEvent = "all_names_used"; broadcast(); return cb({ ok: true });
@@ -250,6 +296,8 @@ io.on("connection", socket => {
   });
 
   socket.on("new-game", ({ keepPlayers }, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     const players = keepPlayers ? [...state.players] : [];
     const gameNumber = (Number(state.gameNumber) || 1) + 1;
     state = initial();
@@ -260,6 +308,8 @@ io.on("connection", socket => {
   });
 
   socket.on("remove-player", ({ playerId }, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     if (state.phase !== "setup") return cb({ error: "يمكن تعديل اللاعبين قبل بدء اللعبة فقط." });
     state.players = state.players.filter(p => p.id !== playerId);
     state.names = state.names.filter(n => n.owner !== playerId);
@@ -268,26 +318,21 @@ io.on("connection", socket => {
   });
 
   socket.on("end-save", (_payload, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     persist().then(() => cb({ ok: true })).catch(() => cb({ error: "تعذر حفظ اللعبة حالياً." }));
   });
 
   socket.on("reset-all", (_payload, cb = () => {}) => {
+    activeRoomId = roomId;
+    state = loadRoom(roomId);
     state = initial(); broadcast(); cb({ ok: true });
   });
 });
 
 async function start() {
   if (pool) {
-    await pool.query("CREATE TABLE IF NOT EXISTS play_with_ray_state (id SMALLINT PRIMARY KEY, state JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
-    const { rows } = await pool.query("SELECT state FROM play_with_ray_state WHERE id = 1");
-    if (rows[0]?.state) state = rows[0].state;
-  }
-  const recoveredFinishedGame = recoverFinishedGame();
-  if (!state.skipsUsed || typeof state.skipsUsed !== "object") state.skipsUsed = {};
-  if (pool && (recoveredFinishedGame || !(await pool.query("SELECT 1 FROM play_with_ray_state WHERE id = 1")).rowCount)) {
-    await persist();
-  } else if (!pool && recoveredFinishedGame) {
-    await persist();
+    await pool.query("CREATE TABLE IF NOT EXISTS play_with_ray_rooms (room_id TEXT PRIMARY KEY, state JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())");
   }
   httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`Play With Ray server listening on port ${PORT}`);
@@ -297,8 +342,13 @@ async function start() {
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.once(signal, () => {
     void (async () => {
-      try { await persist(); }
-      catch (error) { console.error("Could not save before shutdown:", error.message); }
+      try {
+        for (const [roomId, roomState] of states) {
+          activeRoomId = roomId;
+          state = roomState;
+          await persist();
+        }
+      } catch (error) { console.error("Could not save before shutdown:", error.message); }
       if (pool) await pool.end().catch(error => console.error("Could not close database:", error.message));
       io.close(() => process.exit(0));
       setTimeout(() => process.exit(1), 25_000).unref();
