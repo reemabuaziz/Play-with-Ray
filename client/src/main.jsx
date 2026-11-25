@@ -191,7 +191,7 @@ function App() {
       </section>}
     </>}
 
-    <footer>Created by Eng. Ray</footer>
+    <footer><a href="mailto:Reemabuaziz25@gmail.com">Reemabuaziz25@gmail.com</a><span>•</span>Created by Eng. Ray</footer>
     {toast && <div className="toast">{toast}</div>}
     {showRules && <div className="modal-backdrop" onClick={()=>setShowRules(false)}><section className="modal" onClick={e=>e.stopPropagation()}><button className="close" onClick={()=>setShowRules(false)}>×</button><h2>قوانين اللعبة ⭕</h2><ul>
       <li>الفوز يبدأ من 1000 نقطة.</li><li>للاعب 25 ثانية للشرح.</li><li>كلمة أو جملة واحدة فقط، مع لون واحد ومكان واحد كحد أقصى.</li><li>أول من يخمن يحصل على 100 نقطة، والشارح يحصل على 50 نقطة.</li><li>إذا لم يخمن أحد، يخسر الشارح 100 نقطة.</li><li>يمنع ذكر الاسم أو الجنسية أو صلة القرابة أو الجنس.</li><li>يمنع اختيار شخص يعرفه لاعب واحد فقط أو لا يعرفه جميع الموجودين.</li><li>الغش يخصم 100 نقطة حسب قرار مدير اللعبة.</li></ul><button className="btn blue" onClick={()=>setShowRules(false)}>إغلاق</button></section></div>}
